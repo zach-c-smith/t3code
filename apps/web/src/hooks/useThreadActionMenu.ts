@@ -21,6 +21,7 @@ import {
   threadActionRequiresOperate,
   type ThreadActionMenuId,
 } from "../components/threadActionMenu.logic";
+import { useThreadGroupActions } from "./useThreadGroupActions";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { copyThreadReference } from "../lib/copyThreadReference";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
@@ -88,6 +89,7 @@ export function useThreadActionMenu(input: {
     markThreadUnread,
     turnThreadIntoProject,
   } = useThreadActions();
+  const { groupMenuState, handleGroupMenuAction } = useThreadGroupActions();
   const updateThreadMetadata = useOrchestrationCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
@@ -152,6 +154,7 @@ export function useThreadActionMenu(input: {
         snoozePresets,
         canShareWithGuest,
         canTurnIntoProject: canTurnThreadIntoProject(threadRef),
+        ...(configLoaded ? { groups: groupMenuState(thread) } : {}),
       });
       const clicked = await settlePromise(() => api.contextMenu.show(items, position));
       if (clicked._tag === "Failure" || clicked.value === null) return;
@@ -183,6 +186,7 @@ export function useThreadActionMenu(input: {
         }
         return;
       }
+      if (await handleGroupMenuAction(threadRef, action)) return;
       const reportFailure = async (
         title: string,
         run: () => Promise<AtomCommandResult<unknown, unknown>>,

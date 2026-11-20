@@ -78,8 +78,10 @@ import {
   useSyncExternalStore,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { type AnyRouter, useRouter } from "@tanstack/react-router";
 
 import {
@@ -99,6 +101,7 @@ import {
 import { isModelPickerOpen } from "../modelPickerVisibility";
 import { isMacPlatform } from "~/lib/utils";
 import { readLocalApi } from "../localApi";
+import { useEnvironmentQuery } from "../state/query";
 import { configuredHostedAppUrl } from "../hostedPairing";
 import { useSidebarPendingFileDropStore } from "../sidebarPendingFileDropStore";
 import {
@@ -147,7 +150,7 @@ import {
   useQuietThreadShells,
 } from "../state/entities";
 import { environmentPresentations } from "../state/presentation";
-import { primaryServerKeybindingsAtom } from "../state/server";
+import { primaryServerKeybindingsAtom, serverEnvironment } from "../state/server";
 import { environmentProjects } from "../state/projects";
 import { threadEnvironment } from "../state/threads";
 import { useOlderSettledShelf, useOlderSettledShelfGrowth } from "../state/olderSettledShelf";
@@ -260,6 +263,7 @@ import {
   SidebarSearchResultRow,
   SortableThreadRow,
   type SidebarProviderEntry,
+  type SidebarRowDivider,
   type SidebarSweepAction,
 } from "./sidebar/SidebarThreadRow";
 import { SidebarDraftBlock } from "./sidebar/SidebarDraftBlock";
@@ -269,9 +273,24 @@ import {
 } from "./sidebar/SidebarProjectFolderHeader";
 import {
   SidebarDragBoundary,
+  SidebarGroupHeader,
   SidebarSectionHeader,
   SidebarSectionPlaceholder,
 } from "./sidebar/SidebarListMarkers";
+import {
+  arrangeThreadGroups,
+  isThreadGroupExpanded,
+  moveThreadGroup,
+  renameThreadGroupPlacement,
+  THREAD_GROUP_ZONES,
+  type ThreadGroupZone,
+  resolveSidebarGroupDropTarget,
+  sidebarGroupHeaderMarker,
+  sidebarGroupNameOfMarker,
+  threadGroupName,
+} from "./sidebar/threadGroups";
+import { requestThreadGroupName } from "./ThreadGroupNameDialog";
+import { useThreadGroupActions } from "../hooks/useThreadGroupActions";
 
 function sameSidebarProviderEntries(
   left: ReadonlyMap<string, SidebarProviderEntry>,
@@ -330,6 +349,15 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
 const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
 const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
 const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
+const GroupShelvesExpandedSchema = Schema.Record(Schema.String, Schema.Boolean);
+const GROUP_SHELVES_EXPANDED_KEY = "t3code:sidebar:group-shelves-expanded";
+const GroupShelfPlacementSchema = Schema.Record(
+  Schema.String,
+  Schema.Struct({ zone: Schema.Literals(["top", "middle", "bottom"]), rank: Schema.Number }),
+);
+const GROUP_SHELF_PLACEMENT_KEY = "t3code:sidebar:group-shelf-placement";
+/** Pointer travel before a press on a group header becomes a move instead of a click. */
+const GROUP_MOVE_THRESHOLD_PX = 5;
 
 const inboxReturns = createInboxReturnTracker();
 
@@ -462,6 +490,16 @@ function useSidebarThreads(input: {
     false,
     Schema.Boolean,
   );
+  const [groupShelvesExpanded, setGroupShelvesExpanded] = useLocalStorage(
+    GROUP_SHELVES_EXPANDED_KEY,
+    {},
+    GroupShelvesExpandedSchema,
+  );
+  const [groupShelfPlacement, setGroupShelfPlacement] = useLocalStorage(
+    GROUP_SHELF_PLACEMENT_KEY,
+    {},
+    GroupShelfPlacementSchema,
+  );
   // Shared with the old per-project sidebar, so folders keep their open state.
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
   const setProjectExpanded = useUiStateStore((store) => store.setProjectExpanded);
@@ -487,8 +525,31 @@ function useSidebarThreads(input: {
     clockKey: `${nowMinute}:${snoozeWakeClock}:${inboxReturnsVersion}`,
   });
 
-  const { pinnedThreads, activeThreads, workingThreads, snoozedThreads, settledThreads } =
-    partition;
+  const {
+    pinnedThreads,
+    activeThreads,
+    workingThreads,
+    snoozedThreads,
+    settledThreads,
+    groupedThreads,
+  } = partition;
+  const arrangedGroups = arrangeThreadGroups([...groupedThreads.keys()], groupShelfPlacement);
+  const groupShelves = THREAD_GROUP_ZONES.flatMap((zone) =>
+    arrangedGroups[zone].map((name) => {
+      const threads = groupedThreads.get(name) ?? EMPTY_THREADS;
+      const expanded = isThreadGroupExpanded(groupShelvesExpanded, name);
+      return {
+        name,
+        zone,
+        threads,
+        expanded,
+        visibleThreads: expanded ? threads : routeThreadOnly(threads, routeRowThreadKey),
+      };
+    }),
+  );
+  const groupRowsIn = (zone: ThreadGroupZone) =>
+    groupShelves.filter((shelf) => shelf.zone === zone).flatMap((shelf) => shelf.visibleThreads);
+  const groupedThreadList = groupShelves.flatMap((shelf) => shelf.threads);
   // Older settled threads load in pages; the shelf lists them only as far as they are loaded.
   const olderSettledShelf = useOlderSettledShelf({
     scopes: olderSettledScopes([...serverConfigs.keys()], scopedProjectKeys),
@@ -542,10 +603,13 @@ function useSidebarThreads(input: {
           };
         });
   const orderedThreads = [
+    ...groupRowsIn("top"),
     ...pinnedThreads,
+    ...groupRowsIn("middle"),
     ...(projectFolders === null
       ? activeThreads
       : projectFolders.flatMap((folder) => folder.threads)),
+    ...groupRowsIn("bottom"),
     ...visibleWorkingThreads,
     ...visibleSnoozedThreads,
     ...renderedSettledThreads,
@@ -554,6 +618,8 @@ function useSidebarThreads(input: {
   for (const [list, section] of [
     [pinnedThreads, "pinned"],
     [activeThreads, "active"],
+    // Group rows drag like Active rows; their headers keep drops out of the Active order.
+    [groupedThreadList, "active"],
     [workingThreads, "working"],
     [snoozedThreads, "snoozed"],
     [settledThreads, "settled"],
@@ -564,9 +630,21 @@ function useSidebarThreads(input: {
     ...partition,
     threads,
     workingShelfEnabled,
+    groupShelves,
+    toggleGroupShelf: (name: string) =>
+      setGroupShelvesExpanded((current) => ({
+        ...current,
+        [name]: !isThreadGroupExpanded(current, name),
+      })),
+    arrangedGroups,
+    moveGroupShelf: (name: string, zone: ThreadGroupZone, index: number) =>
+      setGroupShelfPlacement(moveThreadGroup(arrangedGroups, name, zone, index)),
+    renameGroupShelfPlacement: (from: string, to: string | null) =>
+      setGroupShelfPlacement((current) => renameThreadGroupPlacement(current, from, to)),
     searchableThreads: [
       ...pinnedThreads,
       ...activeThreads,
+      ...groupedThreadList,
       ...workingThreads,
       ...snoozedThreads,
       ...settledThreads,
@@ -633,6 +711,19 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
       : active;
   const snoozed: EnvironmentThreadShell[] = [];
   const settled: EnvironmentThreadShell[] = [];
+  // A group wins over Pinned (the user filed it there); Snoozed and Settled win over a group, and
+  // the tag stays, so a woken or un-settled thread returns to its group.
+  const grouped = new Map<string, EnvironmentThreadShell[]>();
+  const inboxOrGroup = (thread: EnvironmentThreadShell, manuallyMoved = false) => {
+    const group = threadGroupName(thread.source);
+    if (group === null) return inbox(thread, manuallyMoved);
+    let list = grouped.get(group);
+    if (list === undefined) {
+      list = [];
+      grouped.set(group, list);
+    }
+    return list;
+  };
   const { draggableThreadKeys, activeReorderableThreadKeys } = resolveSidebarReorderableThreadKeys({
     threads: visible,
     serverConfigs,
@@ -652,7 +743,7 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
         ? pinned
         : optimisticDrop.section === "settled"
           ? settled
-          : inbox(projected, true)
+          : inboxOrGroup(projected, true)
       ).push(
         optimisticDrop.clearsSnooze
           ? projected
@@ -668,9 +759,9 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
         ? snoozed
         : section === "settled"
           ? settled
-          : section === "pinned"
+          : section === "pinned" && threadGroupName(thread.source) === null
             ? pinned
-            : inbox(thread)
+            : inboxOrGroup(thread)
       ).push(thread);
     }
   }
@@ -707,6 +798,9 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
         firstValidTimestampMs(right.snoozedUntil ?? null),
     ),
     settledThreads: sortSettledThreads(settled),
+    groupedThreads: new Map(
+      [...grouped].map(([name, list]) => [name, sortThreadsForSidebar(list)] as const),
+    ),
     visibleThreads: visible,
     snoozeNow: preciseNow,
   };
@@ -996,6 +1090,18 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
   // Row callbacks capture only the handler; the rest of the context changes with the route.
   const { handleNewThread } = newThreadContext;
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  // Threads with an enabled scheduled task still to run show a clock. Read live, so it can't go
+  // stale the way a title prefix written at a turn's end does.
+  const scheduledTasksQuery = useEnvironmentQuery(
+    primaryEnvironmentId === null
+      ? null
+      : serverEnvironment.scheduledTasksLive({ environmentId: primaryEnvironmentId, input: {} }),
+  );
+  const scheduledThreadIds = new Set(
+    (scheduledTasksQuery.data?.tasks ?? []).flatMap((task) =>
+      task.enabled && task.nextRunAt !== null && task.threadId !== null ? [task.threadId] : [],
+    ),
+  );
   const clearSelection = useThreadSelectionStore((s) => s.clearSelection);
   const setSelectionAnchor = useThreadSelectionStore((s) => s.setAnchor);
   const toggleThreadSelection = useThreadSelectionStore((s) => s.toggleThread);
@@ -1052,6 +1158,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     readonly occurredAt: string;
     readonly activationY: number | null;
     readonly targetSection: SidebarSection | null;
+    /** The group shelf under the pointer, when the drop would move the thread into it. */
+    readonly targetGroup?: string | null;
     readonly contextDrag: boolean;
   } | null>(null);
   const dragSensorRef = useRef<SidebarPointerSensor | null>(null);
@@ -1299,8 +1407,16 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     },
   );
 
+  const { moveThreadToGroup, renameGroup, deleteGroup, groupMenuState, handleGroupMenuAction } =
+    useThreadGroupActions();
+
   const {
     workingShelfEnabled,
+    groupShelves,
+    toggleGroupShelf,
+    arrangedGroups,
+    moveGroupShelf,
+    renameGroupShelfPlacement,
     pinnedThreads,
     draggableThreadKeys,
     activeReorderableThreadKeys,
@@ -1353,6 +1469,157 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     keepEmptyFolders: (group) =>
       scopedProjectGroups.length > 0 || (group.pinned && !group.archived),
   });
+  const firstBottomGroupShelf = groupShelves.find((shelf) => shelf.zone === "bottom");
+  const handleGroupShelfContextMenu = useStableCallback(
+    (name: string, position: { x: number; y: number }) => {
+      const api = readLocalApi();
+      if (!api) return;
+      void (async () => {
+        const clicked = await settlePromise(() =>
+          api.contextMenu.show(
+            [
+              { id: "rename", label: "Rename group", icon: "pencil" },
+              { id: "delete", label: "Delete group", icon: "trash", destructive: true },
+            ],
+            position,
+          ),
+        );
+        if (clicked._tag === "Failure") return;
+        switch (clicked.value) {
+          case "rename": {
+            const next = await requestThreadGroupName({
+              title: "Rename group",
+              submitLabel: "Rename",
+              initialName: name,
+            });
+            if (next !== null && next !== name) {
+              await renameGroup(name, next);
+              renameGroupShelfPlacement(name, next);
+            }
+            return;
+          }
+          case "delete": {
+            const confirmed = await settlePromise(() =>
+              api.dialogs.confirm(
+                [
+                  `Delete group "${name}"?`,
+                  "Its threads go back to Active. No thread is deleted.",
+                ].join("\n"),
+              ),
+            );
+            if (confirmed._tag === "Failure" || !confirmed.value) return;
+            await deleteGroup(name);
+            renameGroupShelfPlacement(name, null);
+            return;
+          }
+        }
+      })();
+    },
+  );
+
+  // Dragging a group header moves the whole shelf: above Pinned, between Pinned and Active, or
+  // among the bottom shelves. A plain pointer drag, apart from the thread drag-and-drop.
+  const [groupMove, setGroupMove] = useState<{
+    readonly name: string;
+    readonly line: { readonly top: number; readonly left: number; readonly width: number } | null;
+  } | null>(null);
+  const suppressGroupToggleRef = useRef(false);
+  const startGroupMove = (name: string, event: ReactPointerEvent<HTMLLIElement>) => {
+    if (event.button !== 0 || dragState !== null) return;
+    const list = event.currentTarget.parentElement;
+    if (list === null) return;
+    const pointerId = event.pointerId;
+    const startY = event.clientY;
+    let moving = false;
+    let target: { zone: ThreadGroupZone; index: number } | null = null;
+    const topOf = (marker: string) =>
+      list
+        .querySelector<HTMLElement>(`[data-sidebar-marker="${CSS.escape(marker)}"]`)
+        ?.getBoundingClientRect().top;
+    const slots = () => {
+      const found: Array<{ zone: ThreadGroupZone; index: number; y: number }> = [];
+      for (const zone of THREAD_GROUP_ZONES) {
+        const names = arrangedGroups[zone];
+        for (const [index, group] of names.entries()) {
+          const y = topOf(sidebarGroupHeaderMarker(group));
+          if (y !== undefined) found.push({ zone, index, y });
+        }
+        const end =
+          zone === "top"
+            ? topOf("pinned-header")
+            : zone === "middle"
+              ? topOf("pinned-divider")
+              : (topOf("working-header") ?? topOf("snoozed-header") ?? topOf("settled-header"));
+        if (end !== undefined) found.push({ zone, index: names.length, y: end });
+      }
+      return found;
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKey);
+    };
+    const onMove = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      if (!moving && Math.abs(moveEvent.clientY - startY) < GROUP_MOVE_THRESHOLD_PX) return;
+      moving = true;
+      let best: { zone: ThreadGroupZone; index: number; y: number } | null = null;
+      for (const slot of slots()) {
+        if (
+          best === null ||
+          Math.abs(slot.y - moveEvent.clientY) < Math.abs(best.y - moveEvent.clientY)
+        )
+          best = slot;
+      }
+      target = best === null ? null : { zone: best.zone, index: best.index };
+      const rect = list.getBoundingClientRect();
+      setGroupMove({
+        name,
+        line: best === null ? null : { top: best.y, left: rect.left, width: rect.width },
+      });
+    };
+    const finish = (commit: boolean) => {
+      cleanup();
+      if (moving) {
+        // The click that ends a move must not also fold the shelf.
+        suppressGroupToggleRef.current = true;
+        window.setTimeout(() => {
+          suppressGroupToggleRef.current = false;
+        }, 0);
+        if (commit && target !== null) moveGroupShelf(name, target.zone, target.index);
+      }
+      setGroupMove(null);
+    };
+    const onUp = (upEvent: PointerEvent) => {
+      if (upEvent.pointerId === pointerId) finish(true);
+    };
+    const onCancel = (cancelEvent: PointerEvent) => {
+      if (cancelEvent.pointerId === pointerId) finish(false);
+    };
+    const onKey = (keyEvent: KeyboardEvent) => {
+      if (keyEvent.key === "Escape") finish(false);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKey);
+  };
+  const groupMoveLine =
+    groupMove?.line == null
+      ? null
+      : createPortal(
+          <div
+            aria-hidden
+            className="pointer-events-none fixed z-50 h-0.5 rounded-full bg-primary"
+            style={{
+              top: groupMove.line.top - 1,
+              left: groupMove.line.left + 8,
+              width: Math.max(0, groupMove.line.width - 16),
+            }}
+          />,
+          document.body,
+        );
 
   // Ranked across environments as the palette ranks them, so one
   // environment's list does not sit above another's better matches; rows
@@ -1723,6 +1990,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     dragState?.contextDrag === true ||
     dragState?.activeSection === "working";
   const dragTargetSection = isContextDrag ? null : (dragState?.targetSection ?? null);
+  const dragTargetGroup = isContextDrag ? null : (dragState?.targetGroup ?? null);
   const finishThreadDrag = (started: boolean) => {
     dragSensorRef.current = null;
     contextDragKeyRef.current = null;
@@ -1942,6 +2210,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
       !hasProjectFolders &&
       pinnedThreads.length +
         activeThreads.length +
+        groupShelves.length +
         workingThreads.length +
         snoozedThreads.length +
         settledCount ===
@@ -1949,13 +2218,25 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     ) {
       return [];
     }
-    const items: SidebarListItem[] = [{ kind: "marker", marker: "pinned-header" }];
+    const items: SidebarListItem[] = [];
+    // Group shelves sit above Pinned, between Pinned and Active, or in the bottom area.
+    const pushGroups = (zone: ThreadGroupZone) => {
+      for (const shelf of groupShelves) {
+        if (shelf.zone !== zone) continue;
+        items.push({ kind: "marker", marker: sidebarGroupHeaderMarker(shelf.name) });
+        items.push(...rowsOf(shelf.visibleThreads, "active"));
+      }
+    };
+    pushGroups("top");
+    items.push({ kind: "marker", marker: "pinned-header" });
     const pinnedRows = rowsOf(pinnedThreads, "pinned");
     items.push(...pinnedRows);
+    pushGroups("middle");
     items.push({ kind: "marker", marker: "pinned-divider" });
     const activeRows = rowsOf(activeThreads, "active");
     items.push({ kind: "marker", marker: "active-placeholder" });
     items.push(...activeRows);
+    pushGroups("bottom");
     if (workingThreads.length > 0) {
       items.push({ kind: "marker", marker: "working-header" });
       items.push(...rowsOf(visibleWorkingThreads, "working"));
@@ -1969,6 +2250,52 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     items.push({ kind: "marker", marker: "settled-placeholder" });
     items.push(...settledRows);
     return items;
+  })();
+  // The line above each card and shelf header (see SidebarRowDivider): every shelf header, a
+  // group's or Working, Snoozed and Settled, gets a dashed line when anything is above it.
+  const { rowDividers, dashedShelfHeaders } = (() => {
+    const dividers = new Map<string, SidebarRowDivider>();
+    const dashed = new Set<string>();
+    let previous:
+      | { readonly kind: "thread"; readonly section: SidebarSection; readonly inGroup: boolean }
+      | { readonly kind: "group" | "shelf" }
+      | null = null;
+    let inGroup = false;
+    for (const item of sidebarListItemsFresh) {
+      if (item.kind === "marker") {
+        const group = sidebarGroupNameOfMarker(item.marker);
+        if (group !== null) {
+          if (previous !== null) dashed.add(item.marker);
+          previous = { kind: "group" };
+          inGroup = true;
+        } else if (item.marker === "pinned-header" || item.marker === "pinned-divider") {
+          inGroup = false;
+        } else if (
+          item.marker === "working-header" ||
+          item.marker === "snoozed-header" ||
+          item.marker === "settled-header"
+        ) {
+          if (previous !== null) dashed.add(item.marker);
+          previous = { kind: "shelf" };
+          inGroup = false;
+        }
+        continue;
+      }
+      if (previous?.kind === "thread") {
+        dividers.set(
+          item.key,
+          // Leaving a group, or Pinned, gets the thick line; a group's own header gets the dashed one.
+          previous.inGroup !== inGroup ||
+            (previous.section === "pinned" && item.section !== "pinned")
+            ? "section"
+            : "thread",
+        );
+      }
+      // A folded group's header followed by threads outside it: the thick line, as when it is open.
+      if (previous?.kind === "group" && !inGroup) dividers.set(item.key, "section");
+      previous = { kind: "thread", section: item.section, inGroup };
+    }
+    return { rowDividers: dividers, dashedShelfHeaders: dashed };
   })();
   // Preserve the list while streamed updates leave order unchanged to retain row memoization.
   const sidebarListItemsKey = sidebarListItemsFresh
@@ -2005,9 +2332,12 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     dragState === null && sidebarListItems.length + visibleDraftSessionCount > 0;
   // Cache on both fields so layout-key changes trigger the effect even when animate is unchanged.
   const listMotionPass = { layoutKey: listMotionLayoutKey, animate: listMotionAnimate };
-  const shelfExpansionKey = [workingShelfExpanded, snoozedShelfExpanded, settledShelfExpanded].join(
-    ":",
-  );
+  const shelfExpansionKey = [
+    ...groupShelves.map((shelf) => `${shelf.name}=${shelf.expanded}`),
+    workingShelfExpanded,
+    snoozedShelfExpanded,
+    settledShelfExpanded,
+  ].join(":");
   const previousShelfExpansionKeyRef = useRef(shelfExpansionKey);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- tells the list motion controller to animate or not after each layout-affecting commit
   useLayoutEffect(() => {
@@ -2016,14 +2346,31 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     previousShelfExpansionKeyRef.current = shelfExpansionKey;
     listMotionRef.current?.update(listMotionPass.animate && shelvesUnchanged);
   }, [listMotionPass, shelfExpansionKey]);
+  const groupDropTargetOf = (activeKey: string, overId: string): string | null => {
+    const group = resolveSidebarGroupDropTarget(
+      sidebarListItems,
+      sidebarListItemId,
+      activeKey,
+      overId,
+    );
+    const thread = threadByKey.get(activeKey);
+    // Active, Pinned and group rows join groups (a pinned one is asked to unpin first); the
+    // group a thread is already in is no target.
+    if (group === null || thread === undefined) return null;
+    const from = sectionByThreadKey.get(activeKey);
+    if (from !== "active" && from !== "pinned") return null;
+    return threadGroupName(thread.source) === group ? null : group;
+  };
   const handleThreadDragOver = (event: DragOverEvent) => {
+    const activeKey = String(event.active.id);
     const target = event.over
-      ? resolveSidebarDropTarget(sidebarListItems, String(event.active.id), String(event.over.id))
+      ? resolveSidebarDropTarget(sidebarListItems, activeKey, String(event.over.id))
       : null;
+    const targetGroup = event.over ? groupDropTargetOf(activeKey, String(event.over.id)) : null;
     setDragState((current) =>
-      current === null || current.activeKey !== String(event.active.id)
+      current === null || current.activeKey !== activeKey
         ? current
-        : { ...current, targetSection: target?.section ?? null },
+        : { ...current, targetSection: target?.section ?? null, targetGroup },
     );
   };
   const sortableIds = sidebarListItems.map(sidebarListItemId);
@@ -2059,8 +2406,16 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     if (source === undefined) return createSidebarCollisionDetection(() => false);
     return createSidebarCollisionDetection(
       (id) => {
+        if (groupDropTargetOf(draggedThreadKey, id) !== null) return true;
         const target = resolveSidebarDropTarget(sidebarListItems, draggedThreadKey, id);
         if (target === null) return false;
+        // A group row dropped on Active leaves its group, even when Active has no manual order.
+        if (
+          draggedFromSection === "active" &&
+          threadGroupName(source.source) !== null &&
+          (target.section === "active" || (target.section === "pinned" && source.pinnedAt != null))
+        )
+          return true;
         return (
           planSidebarThreadDrop({
             activeKey: draggedThreadKey,
@@ -2094,8 +2449,28 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         ? null
         : resolveSidebarDropTarget(sidebarListItems, activeKey, String(event.over.id));
     const activeThread = threadByKey.get(activeKey);
+    const groupTarget =
+      event.over === null ? null : groupDropTargetOf(activeKey, String(event.over.id));
+    if (activeThread !== undefined && groupTarget !== null) {
+      void moveThreadToGroup(
+        scopeThreadRef(activeThread.environmentId, activeThread.id),
+        groupTarget,
+      );
+      return;
+    }
     if (activeSection === undefined || target === null || activeThread === undefined) return;
     const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
+    // Dragging a group row back to Active takes it out of its group; so does dragging an
+    // already-pinned group row to Pinned (it shows in Pinned once it has no group).
+    if (
+      activeSection === "active" &&
+      threadGroupName(activeThread.source) !== null &&
+      (target.section === "active" ||
+        (target.section === "pinned" && activeThread.pinnedAt != null))
+    ) {
+      void moveThreadToGroup(threadRef, null);
+      return;
+    }
     const plan = planSidebarThreadDrop({
       activeKey,
       activeSection,
@@ -2113,6 +2488,10 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     });
     if (plan.kind === "none") return;
     if (plan.kind === "settle" && settlingThreadKeysRef.current.has(activeKey)) return;
+    // A grouped thread shows in its group even when pinned, so a drop on Pinned also ungroups it.
+    if (plan.kind === "pin" && threadGroupName(activeThread.source) !== null) {
+      void moveThreadToGroup(threadRef, null);
+    }
     const assignments =
       plan.kind === "pin"
         ? [
@@ -2662,12 +3041,14 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                 titleRegeneration: configLoaded,
               },
               snoozePresets,
+              ...(configLoaded ? { groups: groupMenuState(thread) } : {}),
             }),
             position,
           ),
         );
         if (clicked._tag === "Failure" || clicked.value === null) return;
         if (threadActionRequiresOperate(clicked.value) && !checkThreadOperations([thread])) return;
+        if (await handleGroupMenuAction(threadRef, clicked.value)) return;
         if (clicked.value?.startsWith("snooze:")) {
           const preset =
             clicked.value === "snooze:custom"
@@ -3387,6 +3768,11 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               routeRowThreadKey === threadKey ? revealActiveRow : undefined
                             }
                             isRouteThread={routeThreadKey === threadKey}
+                            dividerAbove={folderRow ? undefined : rowDividers.get(threadKey)}
+                            isScheduled={
+                              thread.environmentId === primaryEnvironmentId &&
+                              scheduledThreadIds.has(thread.id)
+                            }
                             openPullRequestsInRightPanel={routeThreadRef !== null}
                             jumpLabel={
                               showJumpHints ? (jumpLabelByKey.get(threadKey) ?? null) : null
@@ -3477,6 +3863,36 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                           }
                           continue;
                         }
+                        const groupName = sidebarGroupNameOfMarker(item.marker);
+                        if (groupName !== null) {
+                          const shelf = groupShelves.find((entry) => entry.name === groupName);
+                          if (shelf !== undefined) {
+                            items.push(
+                              <SidebarGroupHeader
+                                key={`group-shelf-header:${groupName}`}
+                                name={groupName}
+                                className={cn(firstBottomGroupShelf === shelf && "mt-auto")}
+                                moving={groupMove?.name === groupName}
+                                dashedAbove={dashedShelfHeaders.has(item.marker)}
+                                onMoveStart={(event) => startGroupMove(groupName, event)}
+                                count={shelf.threads.length}
+                                dragging={from !== null}
+                                isDropTarget={dragTargetGroup === groupName}
+                                toggle={{
+                                  expanded: shelf.expanded,
+                                  onToggle: () => {
+                                    if (!suppressGroupToggleRef.current)
+                                      toggleGroupShelf(groupName);
+                                  },
+                                }}
+                                onContextMenu={(position) =>
+                                  handleGroupShelfContextMenu(groupName, position)
+                                }
+                              />,
+                            );
+                          }
+                          continue;
+                        }
                         switch (item.marker) {
                           case "pinned-header":
                             items.push(
@@ -3523,7 +3939,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               <SidebarSectionHeader
                                 key="working-shelf-header"
                                 marker="working-header"
-                                className="mt-auto"
+                                dashedAbove={dashedShelfHeaders.has("working-header")}
+                                className={cn(firstBottomGroupShelf === undefined && "mt-auto")}
                                 label="Working"
                                 count={workingThreads.length}
                                 toggle={{
@@ -3538,7 +3955,12 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               <SidebarSectionHeader
                                 key="snoozed-shelf-header"
                                 marker="snoozed-header"
-                                className={cn(workingThreads.length === 0 && "mt-auto")}
+                                dashedAbove={dashedShelfHeaders.has("snoozed-header")}
+                                className={cn(
+                                  firstBottomGroupShelf === undefined &&
+                                    workingThreads.length === 0 &&
+                                    "mt-auto",
+                                )}
                                 label="Snoozed"
                                 count={snoozedThreads.length}
                                 toggle={{
@@ -3553,8 +3975,11 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               <SidebarSectionHeader
                                 key="settled-shelf-header"
                                 marker="settled-header"
+                                dashedAbove={dashedShelfHeaders.has("settled-header")}
                                 className={cn(
-                                  workingThreads.length + snoozedThreads.length === 0 && "mt-auto",
+                                  firstBottomGroupShelf === undefined &&
+                                    workingThreads.length + snoozedThreads.length === 0 &&
+                                    "mt-auto",
                                 )}
                                 label="Settled"
                                 count={settledCount}
@@ -3615,6 +4040,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                   </ul>
                 </SortableContext>
               </DndContext>
+              {groupMoveLine}
             </TooltipProvider>
           ) : null}
           {!isSearchingThreads &&

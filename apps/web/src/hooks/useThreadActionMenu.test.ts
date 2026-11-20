@@ -118,6 +118,13 @@ vi.mock("./useSettings", () => ({
       timestampFormat: "12-hour",
     }),
 }));
+// Group actions open their own dialogs; the menu only needs their submenu state.
+vi.mock("./useThreadGroupActions", () => ({
+  useThreadGroupActions: () => ({
+    groupMenuState: () => ({ names: [], current: null }),
+    handleGroupMenuAction: async () => false,
+  }),
+}));
 vi.mock("./useThreadActions", () => ({
   canTurnThreadIntoProject: () => false,
   useThreadActions: () =>

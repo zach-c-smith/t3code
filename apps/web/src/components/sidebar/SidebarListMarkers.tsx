@@ -1,14 +1,15 @@
 import { CollapsibleSectionHeader } from "../ui/collapsible-section-header";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { type ReactNode, useLayoutEffect } from "react";
+import { type PointerEvent as ReactPointerEvent, type ReactNode, useLayoutEffect } from "react";
 import { cn } from "~/lib/utils";
 import {
   animateSidebarLayoutChanges,
   sidebarMarkerId,
   type SidebarListMarker,
 } from "../Sidebar.logic";
-import { SIDEBAR_SORTABLE_DRAG_DISABLED } from "./SidebarThreadRow";
+import { SIDEBAR_ROW_DIVIDER_CLASS_NAME, SIDEBAR_SORTABLE_DRAG_DISABLED } from "./SidebarThreadRow";
+import { sidebarGroupHeaderMarker } from "./threadGroups";
 
 function SortableSidebarMarker(props: {
   marker: SidebarListMarker;
@@ -16,6 +17,7 @@ function SortableSidebarMarker(props: {
   children?: ReactNode;
   revealOverflow?: boolean;
   "data-testid"?: string;
+  onPointerDown?: (event: ReactPointerEvent<HTMLLIElement>) => void;
 }) {
   const { node, setNodeRef, transform, transition } = useSortable({
     id: sidebarMarkerId(props.marker),
@@ -33,6 +35,8 @@ function SortableSidebarMarker(props: {
       ref={setNodeRef}
       data-thread-selection-safe
       data-testid={props["data-testid"]}
+      data-sidebar-marker={props.marker}
+      onPointerDown={props.onPointerDown}
       className={cn("list-none", props.className)}
       style={{
         transform: CSS.Translate.toString(transform),
@@ -110,9 +114,58 @@ export function SidebarDragBoundary(props: {
   );
 }
 
+/** A user-named group shelf. It opens like Settled and takes threads dropped on it. */
+export function SidebarGroupHeader(props: {
+  name: string;
+  count: number;
+  className?: string;
+  dragging?: boolean;
+  isDropTarget?: boolean;
+  /** This header is being dragged to a new place. */
+  moving?: boolean;
+  /** A dashed line above the header, where something comes before this group. */
+  dashedAbove?: boolean;
+  toggle: { expanded: boolean; onToggle: () => void };
+  onContextMenu: (position: { x: number; y: number }) => void;
+  /** Starts a drag of the whole shelf to another place in the sidebar. */
+  onMoveStart?: (event: ReactPointerEvent<HTMLLIElement>) => void;
+}) {
+  return (
+    <SortableSidebarMarker
+      marker={sidebarGroupHeaderMarker(props.name)}
+      data-testid="sidebar-group-header"
+      className={cn(
+        "relative mx-0.5 h-8 touch-none",
+        props.moving && "opacity-50",
+        props.dashedAbove && SIDEBAR_ROW_DIVIDER_CLASS_NAME.group,
+        props.className,
+      )}
+      {...(props.onMoveStart === undefined ? {} : { onPointerDown: props.onMoveStart })}
+    >
+      <CollapsibleSectionHeader
+        data-sidebar-row={`shelf:group:${props.name}`}
+        onClick={props.toggle.onToggle}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          props.onContextMenu({ x: event.clientX, y: event.clientY });
+        }}
+        expanded={props.toggle.expanded}
+        tone={props.isDropTarget ? "accent" : props.dragging ? "emphasized" : "muted"}
+        data-testid="sidebar-group-shelf-toggle"
+        title={props.name}
+        accessory={<span className="font-normal tabular-nums">{props.count}</span>}
+      >
+        {props.name}
+      </CollapsibleSectionHeader>
+    </SortableSidebarMarker>
+  );
+}
+
 export function SidebarSectionHeader(props: {
   marker: "working-header" | "snoozed-header" | "settled-header";
   label: string;
+  /** A dashed line above the header, where something comes before this shelf. */
+  dashedAbove?: boolean;
   /** A muted trailing count. */
   count: number;
   className?: string;
@@ -130,7 +183,11 @@ export function SidebarSectionHeader(props: {
     <SortableSidebarMarker
       marker={props.marker}
       data-testid={`sidebar-${props.marker}`}
-      className={cn("relative mx-0.5 h-8", props.className)}
+      className={cn(
+        "relative mx-0.5 h-8",
+        props.dashedAbove && SIDEBAR_ROW_DIVIDER_CLASS_NAME.group,
+        props.className,
+      )}
     >
       <CollapsibleSectionHeader
         data-sidebar-row={`shelf:${shelf}`}

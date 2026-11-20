@@ -1,5 +1,6 @@
 import { useAtomMount } from "@effect/atom-react";
 import { asLaunchingThread } from "@t3tools/client-runtime/state/thread-inbox";
+import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { ThreadTerminalStatusButton } from "../ThreadStatusIndicators";
 import { discardComposerDraft } from "../../lib/discardComposerDraft";
@@ -38,6 +39,7 @@ import {
   AlarmClockIcon,
   AlarmClockOffIcon,
   ArrowRightLeftIcon,
+  CalendarClockIcon,
   CheckIcon,
   CircleAlertIcon,
   CircleCheckIcon,
@@ -439,6 +441,28 @@ type SortableThreadRowBag = Pick<
 export const draftSurfaceClassName = "bg-warning/4 hover:bg-warning/8";
 export const draftPenClassName = "size-3 shrink-0 text-warning-foreground";
 
+/**
+ * The line drawn above a row: a faint one between two threads, a thick one where Pinned or a
+ * group ends and other threads start, and a dashed one above a group's header. It sits in the
+ * gap above the row and takes no space.
+ */
+export type SidebarRowDivider = "thread" | "section" | "group";
+export const SIDEBAR_ROW_DIVIDER_CLASS_NAME: Record<SidebarRowDivider, string> = {
+  thread:
+    "relative before:pointer-events-none before:absolute before:inset-x-2 before:top-0 before:h-px before:bg-sidebar-foreground/15 before:content-['']",
+  section:
+    "relative before:pointer-events-none before:absolute before:inset-x-1 before:top-0 before:h-0.5 before:rounded-full before:bg-sidebar-foreground/45 before:content-['']",
+  group:
+    "relative before:pointer-events-none before:absolute before:inset-x-2 before:top-0 before:h-0 before:border-t before:border-dashed before:border-sidebar-foreground/40 before:content-['']",
+};
+
+type SidebarRowAttention = "done" | "action" | "failed";
+const SIDEBAR_ROW_ATTENTION_CLASS_NAME: Record<SidebarRowAttention, string> = {
+  done: "bg-success/12 ring-1 ring-success/50 ring-inset hover:bg-success/18",
+  action: "bg-warning/12 ring-1 ring-warning/50 ring-inset hover:bg-warning/18",
+  failed: "bg-error/12 ring-1 ring-error/50 ring-inset hover:bg-error/18",
+};
+
 // useSortable memoizes on its `disabled` object, so a fresh one per render
 // re-renders every row and marker on each sidebar update.
 export const SIDEBAR_SORTABLE_DRAG_DISABLED = { draggable: true } as const;
@@ -538,7 +562,17 @@ const TOP_STATUS_ICONS = {
 
 function TopStatusIcon(props: { icon: keyof typeof TOP_STATUS_ICONS; className: string }) {
   const Icon = TOP_STATUS_ICONS[props.icon];
-  return <Icon aria-hidden className={cn("shrink-0", props.className)} />;
+  return (
+    <Icon
+      aria-hidden
+      className={cn(
+        "shrink-0",
+        // A working thread's icon turns, so busy threads read at a glance.
+        props.icon === "working" && "animate-spin motion-reduce:animate-none",
+        props.className,
+      )}
+    />
+  );
 }
 
 type SidebarThreadRowProps = {
@@ -564,6 +598,10 @@ type SidebarThreadRowProps = {
   // Unlike isActive, never true for the ancestor standing in for an open
   // subagent: drafts and PR clicks care about which composer is on screen.
   isRouteThread: boolean;
+  /** The line above this card, if any. */
+  dividerAbove?: SidebarRowDivider | undefined;
+  /** An enabled scheduled task bound to this thread has a run still to come. */
+  isScheduled?: boolean | undefined;
   openPullRequestsInRightPanel: boolean;
   jumpLabel: string | null;
   currentEnvironmentId: string | null;
@@ -735,6 +773,15 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
     isActive: props.isActive,
     isSelected,
   });
+  const pendingWork = thread.pendingBackgroundTasks ?? [];
+  // Only a command, subagent or task the agent waits on is work in progress. An awaited monitor (a
+  // pull request watch, a CI watch) holds the turn's completion too, but it only waits on something
+  // outside, maybe for hours: that is Watching, and it does not spin.
+  const backgroundRunning =
+    status === "waiting" &&
+    backgroundWorkHoldsCompletion(pendingWork.filter((task) => task.kind !== "monitor"));
+  const watchingOnly =
+    status === "waiting" && !backgroundRunning && backgroundWorkHoldsCompletion(pendingWork);
   const topStatus =
     status === "preparing" || status === "working"
       ? {
@@ -747,56 +794,88 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
           icon: "working" as const,
           className: "text-info-foreground",
         }
-      : status === "waiting"
+      : backgroundRunning
         ? {
-            label: "Waiting",
-            icon: "waiting" as const,
-            className: "text-muted-foreground",
+            // The turn ended but a command, monitor or subagent it waits on still runs: the
+            // thread is busy, not waiting on anyone.
+            label: "Running",
+            icon: "working" as const,
+            className: "text-info-foreground",
           }
-        : status === "approval"
+        : watchingOnly
           ? {
-              label: "Approval",
-              icon: "approval" as const,
-              className: "text-warning-foreground",
+              label: "Watching",
+              icon: "waiting" as const,
+              className: "text-muted-foreground",
             }
-          : status === "input"
+          : status === "waiting"
             ? {
-                label: "Input",
-                icon: "input" as const,
-                className: "text-indigo-600 dark:text-indigo-300",
+                label: "Waiting",
+                icon: "waiting" as const,
+                className: "text-muted-foreground",
               }
-            : status === "request"
+            : status === "approval"
               ? {
-                  label: "Request",
-                  icon: "request" as const,
-                  className: "text-guest-foreground",
+                  label: "Approval",
+                  icon: "approval" as const,
+                  className: "text-warning-foreground",
                 }
-              : status === "limited"
+              : status === "input"
                 ? {
-                    label: "Limited",
-                    icon: "failed" as const,
-                    className: "text-warning-foreground",
+                    label: "Input",
+                    icon: "input" as const,
+                    className: "text-indigo-600 dark:text-indigo-300",
                   }
-                : status === "failed"
+                : status === "request"
                   ? {
-                      label: "Failed",
-                      icon: "failed" as const,
-                      className: "text-error-foreground",
+                      label: "Request",
+                      icon: "request" as const,
+                      className: "text-guest-foreground",
                     }
-                  : isWoke
+                  : status === "limited"
                     ? {
-                        label: "Woke",
-                        icon: "woke" as const,
+                        label: "Limited",
+                        icon: "failed" as const,
                         className: "text-warning-foreground",
                       }
-                    : isUnread
+                    : status === "failed"
                       ? {
-                          label: "Done",
-                          icon: "done" as const,
-                          className: "text-success-foreground",
+                          label: "Failed",
+                          icon: "failed" as const,
+                          className: "text-error-foreground",
                         }
-                      : null;
+                      : isWoke
+                        ? {
+                            label: "Woke",
+                            icon: "woke" as const,
+                            className: "text-warning-foreground",
+                          }
+                        : isUnread
+                          ? {
+                              label: "Done",
+                              icon: "done" as const,
+                              className: "text-success-foreground",
+                            }
+                          : null;
   const isWokeStatus = topStatus?.icon === "woke";
+  // What the card asks of the user, tinted and outlined by kind: amber for an approval, question,
+  // guest request, usage limit or woken snooze; red for an unread failure; green for an unread
+  // finished turn. Nothing while it still spins, and nothing on a snoozed or settled row.
+  const attention: SidebarRowAttention | null =
+    props.variantAction !== "settle" || topStatus?.icon === "working"
+      ? null
+      : status === "failed" && (isUnread || lastVisitedAt === undefined)
+        ? // A failure wins over a wake, and counts in a thread never opened.
+          "failed"
+        : status === "approval" ||
+            status === "input" ||
+            status === "request" ||
+            isWoke ||
+            (isUnread && status === "limited")
+          ? "action"
+          : isUnread
+            ? "done"
+            : null;
 
   const branchMismatch = resolveLocalCheckoutBranchMismatch({
     effectiveEnvMode: thread.worktreePath === null ? "local" : "worktree",
@@ -983,6 +1062,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
     isFileDragOver && !props.isActive && !isSelected && "bg-sidebar-row-hover",
     props.sortable?.isDragging &&
       "bg-sidebar bg-linear-to-b from-sidebar-row-active to-sidebar-row-active text-sidebar-foreground opacity-100 shadow-lg",
+    attention !== null &&
+      !props.isActive &&
+      !isSelected &&
+      SIDEBAR_ROW_ATTENTION_CLASS_NAME[attention],
   );
   const sortable = props.sortable;
   const sortableRootProps = sortable
@@ -1414,6 +1497,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
       {...(fileDropHandlers ?? {})}
       className={cn(
         "list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_78px]",
+        props.dividerAbove !== undefined && SIDEBAR_ROW_DIVIDER_CLASS_NAME[props.dividerAbove],
         metaLineEmpty && "[contain-intrinsic-size:auto_58px]",
         sortable?.isDragging && "relative z-20",
       )}
@@ -1482,6 +1566,13 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                       snoozeMenuOpen && "pointer-events-none absolute right-0 opacity-0",
                     )}
                   >
+                    {props.isScheduled ? (
+                      // From the live scheduled-task list, so it never goes stale like a title.
+                      <CalendarClockIcon
+                        aria-label="Scheduled"
+                        className="mr-1 size-3.5 shrink-0 text-info-foreground"
+                      />
+                    ) : null}
                     {topStatus ? (
                       isWokeStatus ? (
                         <Tooltip>
